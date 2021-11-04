@@ -18,6 +18,7 @@ import utest._
 
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
+import coursier.core.Version
 
 object InstallTests extends TestSuite {
 
@@ -44,10 +45,8 @@ object InstallTests extends TestSuite {
           .asScala
           .foreach(delete)
       }
-      finally {
-        if (s != null)
-          s.close()
-      }
+      finally if (s != null)
+        s.close()
     }
     else
       try Files.deleteIfExists(d)
@@ -59,9 +58,7 @@ object InstallTests extends TestSuite {
   private def withTempDir[T](f: Path => T): T = {
     val tmpDir = Files.createTempDirectory("coursier-install-test")
     try f(tmpDir)
-    finally {
-      delete(tmpDir)
-    }
+    finally delete(tmpDir)
   }
 
   private def withZipFile[T](f: File)(t: ZipFile => T): T = {
@@ -70,10 +67,8 @@ object InstallTests extends TestSuite {
       zf = new ZipFile(f)
       t(zf)
     }
-    finally {
-      if (zf != null)
-        zf.close()
-    }
+    finally if (zf != null)
+      zf.close()
   }
 
   private def assertHasNotEntry(f: File, path: String) =
@@ -160,9 +155,8 @@ object InstallTests extends TestSuite {
       val expected = Seq(0x4d, 0x5a).map(_.toByte)
       assert(buf.toSeq == expected)
     }
-    else {
+    else
       sys.error(s"Unsupported OS: $osName")
-    }
     fis.close()
   }
 
@@ -635,6 +629,49 @@ object InstallTests extends TestSuite {
       test("windows") - run("windows", "x86_64")
     }
 
+    test("install a prebuilt-only zip-ed launcher") {
+      def run(os: String, arch: String) = withTempDir { tmpDir =>
+
+        val id = "sbt"
+        val appInfo0 = appInfo(
+          RawAppDescriptor(List("org.scala-sbt:sbt:1.4.1"))
+            .withRepositories(List("central"))
+            .withLauncherType("prebuilt")
+            .withPrebuilt(Some(
+              "zip+https://github.com/sbt/sbt/releases/download/v${version}/sbt-${version}.zip!sbt/bin/sbt"
+            )),
+          id
+        )
+
+        val installDir0 = installDir(tmpDir, os, arch)
+          .withVerbosity(1)
+
+        val created = installDir0.createOrUpdate(appInfo0)
+        assert(created.exists(identity))
+
+        val launcher = installDir0.actualDest(id)
+
+        def testRun(): Unit = {
+          val output = commandOutput(
+            tmpDir.toFile,
+            mergeError = true,
+            expectedReturnCode = 0,
+            launcher.toAbsolutePath.toString,
+            "-version"
+          )
+          val expectedInOutput = "sbt script version: 1.4.1"
+          assert(output.contains(expectedInOutput))
+        }
+
+        if (currentOs == os)
+          testRun()
+      }
+
+      test("linux") - run("linux", "x86_64")
+      test("mac") - run("mac", "x86_64")
+      test("windows") - run("windows", "x86_64")
+    }
+
     // test("generate a native echo launcher via native-image") - withTempDir { tmpDir =>
     //   val id = "echo"
     //   val appInfo0 = appInfo(
@@ -695,6 +732,93 @@ object InstallTests extends TestSuite {
           }
 
         assert(gotException)
+      }
+
+      test("linux") - run("linux", "x86_64")
+      test("mac") - run("mac", "x86_64")
+      test("windows") - run("windows", "x86_64")
+    }
+
+    test("install, override and update scalac") {
+      def run(os: String, arch: String) = withTempDir { tmpDir =>
+        val id = "scalac"
+        val versionOverride =
+          RawAppDescriptor.RawVersionOverride("(,2.max]")
+            .withDependencies(Some(List("org.scala-lang:scala-compiler:2.12.8")))
+            .withMainClass(Some("scala.tools.nsc.Main"))
+        val appInfo0 = appInfo(
+          RawAppDescriptor(List("org.scala-lang:scala3-compiler_3:3.0.1"))
+            .withRepositories(List("central"))
+            .withMainClass(Some("dotty.tools.dotc.Main"))
+            .withProperties(RawAppDescriptor.Properties(
+              Seq("scala.usejavacp" -> "true")
+            ))
+            .withVersionOverrides(List(versionOverride)),
+          id
+        )
+
+        val installDir0 = installDir(tmpDir, os, arch)
+          .withVerbosity(1)
+
+        val created = installDir0.createOrUpdate(appInfo0)
+        assert(created.exists(identity))
+
+        val launcher = installDir0.actualDest(id)
+        assert(Files.isRegularFile(launcher))
+
+        def testRun(expectedUrls: Seq[String], expectedProperties: Seq[String]): Unit = {
+          assert(Files.isRegularFile(launcher))
+
+          val urls = stringEntry(launcher.toFile, "coursier/bootstrap/launcher/bootstrap-jar-urls")
+            .split('\n')
+            .filter(_.nonEmpty)
+            .toSeq
+          assert(urls == expectedUrls)
+
+          val properties =
+            stringEntry(launcher.toFile, "coursier/bootstrap/launcher/bootstrap.properties")
+              .split('\n')
+              .filter(_.nonEmpty)
+              .toSeq
+          assert(properties == expectedProperties)
+        }
+
+        val scala3CompilerJars =
+          Seq(
+            "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.6/scala-library-2.13.6.jar",
+            "https://repo1.maven.org/maven2/org/scala-lang/scala3-compiler_3/3.0.1/scala3-compiler_3-3.0.1.jar",
+            "https://repo1.maven.org/maven2/org/scala-lang/scala3-library_3/3.0.1/scala3-library_3-3.0.1.jar"
+          )
+        val scala3Properties =
+          Seq(
+            "bootstrap.mainClass=dotty.tools.dotc.Main",
+            "scala.usejavacp=true",
+            "scala3-compiler_3.version=3.0.1"
+          )
+        testRun(scala3CompilerJars, scala3Properties)
+
+        val overridenAppInfo = appInfo0.overrideVersion("2.12.8")
+        val overridden       = installDir0.createOrUpdate(overridenAppInfo)
+        assert(overridden.exists(identity))
+
+        val scala2CompilerJars =
+          Seq(
+            "https://repo1.maven.org/maven2/org/scala-lang/scala-compiler/2.12.8/scala-compiler-2.12.8.jar",
+            "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.12.8/scala-library-2.12.8.jar",
+            "https://repo1.maven.org/maven2/org/scala-lang/scala-reflect/2.12.8/scala-reflect-2.12.8.jar"
+          )
+        val scala2Properties =
+          Seq(
+            "bootstrap.mainClass=scala.tools.nsc.Main",
+            "scala.usejavacp=true",
+            "scala-compiler.version=2.12.8"
+          )
+        testRun(scala2CompilerJars, scala2Properties)
+
+        val updated = installDir0.createOrUpdate(appInfo0)
+        assert(updated.exists(identity))
+
+        testRun(scala3CompilerJars, scala3Properties)
       }
 
       test("linux") - run("linux", "x86_64")

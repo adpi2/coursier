@@ -48,14 +48,14 @@ trait Launchers extends SbtModule with NativeImage {
 
     T {
       mill.define.Target.traverse(allModuleDeps(this :: Nil).distinct)(m =>
-        T.task { m.jar() }
+        T.task(m.jar())
       )()
     }
   }
 
   def nativeImageCsCommand    = Seq(cs.cs)
   def nativeImagePersist      = System.getenv("CI") != null
-  def nativeImageGraalVmJvmId = s"graalvm-java11:${deps.graalVmVersion}"
+  def nativeImageGraalVmJvmId = s"graalvm-java11:$graalVmVersion"
 
   def nativeImageClassPath     = runClasspath()
   def nativeImageName          = "cs"
@@ -104,7 +104,7 @@ trait Launchers extends SbtModule with NativeImage {
         cs.cs,
         "java-home",
         "--jvm",
-        s"graalvm-java11:$graalVmVersion",
+        nativeImageGraalVmJvmId(),
         "--jvm-index",
         jvmIndex
       ).!!.trim
@@ -172,14 +172,13 @@ trait Launchers extends SbtModule with NativeImage {
   def standaloneLauncher = T {
 
     val cachePath = os.Path(coursier.cache.FileCache().location, os.pwd)
-    def urlOf(path: os.Path): Option[String] = {
+    def urlOf(path: os.Path): Option[String] =
       if (path.startsWith(cachePath)) {
         val segments = path.relativeTo(cachePath).segments
         val url      = segments.head + "://" + segments.tail.mkString("/")
         Some(url)
       }
       else None
-    }
 
     import coursier.launcher.{
       AssemblyGenerator,
