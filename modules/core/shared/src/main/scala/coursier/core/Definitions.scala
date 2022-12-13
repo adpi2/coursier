@@ -40,6 +40,7 @@ object ModuleName {
 ) {
   assertValid(organization.value, "organization")
   assertValid(name.value, "module name")
+  assertValidIfSbtPlugin(name, attributes)
 
   def trim: Module = copy(
     organization.map(_.trim),
@@ -252,7 +253,9 @@ object Attributes {
   publications: Seq[(Configuration, Publication)],
 
   // Extra infos, not used during resolution
-  info: Info
+  info: Info,
+  @dataclass.since("2.1.0")
+  useDeprecatedSbtPluginPath: Boolean = false
 ) {
   lazy val moduleVersion = (module, version)
 
@@ -411,6 +414,29 @@ trait ArtifactSource {
   ): Seq[(Publication, Artifact)]
 }
 
+private[coursier] object SbtPlugin {
+  def isSbtPlugin(attributes: Map[String, String]): Boolean = getSuffix(attributes).nonEmpty
+
+  def addSuffix(name: ModuleName, attributes: Map[String, String]): ModuleName = {
+    val adaptedName = for {
+      suffix <- getSuffix(attributes)
+      if !name.value.endsWith(suffix)
+    } yield name.copy(value = name.value + suffix)
+    adaptedName.getOrElse(name)
+  }
+
+  def removeSuffix(name: ModuleName, attributes: Map[String, String]): ModuleName =
+    getSuffix(attributes)
+      .map(suffix => name.copy(value = name.value.stripSuffix(suffix)))
+      .getOrElse(name)
+
+  def getSuffix(attributes: Map[String, String]): Option[String] =
+    for {
+      sbtVersion   <- attributes.get("sbtVersion")
+      scalaVersion <- attributes.get("scalaVersion")
+    } yield s"_${scalaVersion}_$sbtVersion"
+}
+
 private[coursier] object Validation {
   def validateCoordinate(value: String, name: String): Either[String, String] =
     Seq('/', '\\').foldLeft[Either[String, String]](Right(value)) { (acc, char) =>
@@ -419,4 +445,12 @@ private[coursier] object Validation {
 
   def assertValid(value: String, name: String): Unit =
     validateCoordinate(value, name).fold(msg => throw new AssertionError(msg), identity)
+
+  def assertValidIfSbtPlugin(name: ModuleName, attributes: Map[String, String]): Unit =
+    SbtPlugin.getSuffix(attributes).foreach { suffix =>
+      assert(
+        !name.value.endsWith(suffix),
+        s"Redundant suffix $suffix in sbt plugin ${name.value} of attributes ${attributes.mkString(", ")}"
+      )
+    }
 }

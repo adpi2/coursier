@@ -59,17 +59,9 @@ object MavenRepository {
     Configuration.test    -> Seq(Configuration.runtime)
   )
 
-  private[coursier] def dirModuleName(module: Module, sbtAttrStub: Boolean): String =
-    if (sbtAttrStub) {
-      var name = module.name.value
-      for (scalaVersion <- module.attributes.get("scalaVersion"))
-        name = name + "_" + scalaVersion
-      for (sbtVersion <- module.attributes.get("sbtVersion"))
-        name = name + "_" + sbtVersion
-      name
-    }
-    else
-      module.name.value
+  private[coursier] def actualModuleName(module: Module, sbtAttrStub: Boolean): ModuleName =
+    if (sbtAttrStub) SbtPlugin.addSuffix(module.name, module.attributes)
+    else module.name
 
   private[coursier] def parseRawPomSax(str: String): Either[String, Project] =
     coursier.core.compatibility.xmlParseSax(str, new PomParser)
@@ -114,11 +106,15 @@ object MavenRepository {
   // only used during benchmarks
   private[coursier] var useSaxParser = true
 
-  private def modulePath(module: Module): Seq[String] =
-    module.organization.value.split('.').toSeq :+ dirModuleName(module, sbtAttrStub)
+  private def modulePath(organization: Organization, name: ModuleName): Seq[String] =
+    organization.value.split('.').toSeq :+ name.value
 
-  private def moduleVersionPath(module: Module, version: String): Seq[String] =
-    modulePath(module) :+ toBaseVersion(version)
+  private def moduleVersionPath(
+    organization: Organization,
+    name: ModuleName,
+    version: String
+  ): Seq[String] =
+    modulePath(organization, name) :+ toBaseVersion(version)
 
   private[maven] def urlFor(path: Seq[String], isDir: Boolean = false): String = {
     val b = new StringBuilder(root)
@@ -140,15 +136,7 @@ object MavenRepository {
     b.result()
   }
 
-  def projectArtifact(
-    module: Module,
-    version: String,
-    versioningValue: Option[String]
-  ): Artifact = {
-
-    val path = moduleVersionPath(module, version) :+
-      s"${module.name.value}-${versioningValue getOrElse version}.pom"
-
+  private def projectArtifact(path: Seq[String], version: String): Artifact =
     Artifact(
       urlFor(path),
       Map.empty,
@@ -159,12 +147,11 @@ object MavenRepository {
     )
       .withDefaultChecksums
       .withDefaultSignature
-  }
 
   private def versionsArtifact(module: Module): Artifact = {
 
     val path = module.organization.value.split('.').toSeq ++ Seq(
-      dirModuleName(module, sbtAttrStub),
+      actualModuleName(module, sbtAttrStub).value,
       "maven-metadata.xml"
     )
 
@@ -195,7 +182,8 @@ object MavenRepository {
     version: String
   ): Artifact = {
 
-    val path = moduleVersionPath(module, version) :+ "maven-metadata.xml"
+    val actualName = MavenRepository.actualModuleName(module, sbtAttrStub)
+    val path = moduleVersionPath(module.organization, actualName, version) :+ "maven-metadata.xml"
 
     Artifact(
       urlFor(path),
@@ -223,7 +211,8 @@ object MavenRepository {
     F: Monad[F]
   ): EitherT[F, String, (Versions, String)] = {
 
-    val listingUrl = urlFor(modulePath(module)) + "/"
+    val actualName = actualModuleName(module, sbtAttrStub)
+    val listingUrl = urlFor(modulePath(module.organization, actualName)) + "/"
 
     // version listing -> changing (changes as new versions are released)
     val listingArtifact = artifactFor(listingUrl, changing = true)
@@ -368,21 +357,38 @@ object MavenRepository {
     F: Monad[F]
   ): EitherT[F, String, Project] = {
 
-    val projectArtifact0 = projectArtifact(module, version, versioningValue)
+    val actualName    = MavenRepository.actualModuleName(module, sbtAttrStub)
+    val directoryPath = moduleVersionPath(module.organization, actualName, version)
 
-    for {
-      str <- fetch(projectArtifact0)
-      proj0 <- EitherT(F.point[Either[String, Project]](
-        if (useSaxParser) parseRawPomSax(str)
-        else parseRawPomDom(str)
-      ))
-    } yield Pom.addOptionalDependenciesInConfig(
-      proj0
-        .withActualVersionOpt(Some(version))
-        .withConfigurations(defaultConfigurations),
-      Set(Configuration.empty, Configuration.default),
-      Configuration.optional
-    )
+    def parsePom(str: String) =
+      EitherT.fromEither(if (useSaxParser) parseRawPomSax(str) else parseRawPomDom(str))
+
+    def fetchArtifact = {
+      val path = directoryPath :+ s"${actualName.value}-${versioningValue.getOrElse(version)}.pom"
+      val artifact = projectArtifact(path, version)
+      fetch(artifact).flatMap(parsePom)
+    }
+
+    def fetchSbtPlugin: EitherT[F, String, Project] =
+      fetchArtifact.orElse {
+        val deprecatedPath = directoryPath :+
+          s"${module.name.value}-${versioningValue.getOrElse(version)}.pom"
+        val deprecatedArtifact = projectArtifact(deprecatedPath, version)
+        fetch(deprecatedArtifact)
+          .flatMap(parsePom)
+          .map(_.withUseDeprecatedSbtPluginPath(true))
+      }
+
+    (if (SbtPlugin.isSbtPlugin(module.attributes)) fetchSbtPlugin else fetchArtifact)
+      .map { proj0 =>
+        Pom.addOptionalDependenciesInConfig(
+          proj0
+            .withActualVersionOpt(Some(version))
+            .withConfigurations(defaultConfigurations),
+          Set(Configuration.empty, Configuration.default),
+          Configuration.optional
+        )
+      }
   }
 
   private def artifacts0(
@@ -412,16 +418,17 @@ object MavenRepository {
           )
         )
 
-      val path = dependency.module.organization.value.split('.').toSeq ++ Seq(
-        MavenRepository.dirModuleName(dependency.module, sbtAttrStub),
-        toBaseVersion(project.actualVersion),
-        dependency.module.name.value +
+      val actualName = MavenRepository.actualModuleName(dependency.module, sbtAttrStub)
+      val artifactName =
+        if (project.useDeprecatedSbtPluginPath) dependency.module.name.value else actualName.value
+      val path =
+        moduleVersionPath(dependency.module.organization, actualName, project.actualVersion) :+
+          artifactName +
           "-" +
           versioning.getOrElse(project.actualVersion) +
           Some(publication.classifier.value).filter(_.nonEmpty).map("-" + _).mkString +
           "." +
           publication.ext.value
-      )
 
       val changing0 = changing.getOrElse(isSnapshot(project.actualVersion))
 
